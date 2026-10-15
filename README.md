@@ -9,7 +9,32 @@
 pip install wsgidav cheroot requests
 ```
 
-## 配置向导（首次运行）
+## 快速开始（自动引导，推荐）
+
+```bash
+python feishu_dav.py --init
+```
+
+自动引导流程（larkfs init 风格）：
+1. 检查应用凭证：已有配置直接使用；否则按顺序尝试 命令行参数 `--app-id/--app-secret` → 环境变量 `FEISHU_APP_ID/FEISHU_APP_SECRET` → 自动探测本机 `~/.lark-cli/config.json` 里的应用并询问是否复用 → 最后交互输入（并给出开发者后台创建应用的指引）
+2. 未授权则自动打开浏览器完成 OAuth（本地回调 127.0.0.1:8577）
+3. 自动验证云盘访问权限并保存配置
+
+非交互式（CI / 脚本）：
+
+```bash
+python feishu_dav.py --init \
+  --app-id cli_xxx --app-secret xxx \
+  --mount Shared:A14LfVzzTlnOftd19MFcbCXsnld --read-only
+```
+
+自检：
+
+```bash
+python feishu_dav.py --doctor   # 检查配置/凭证/挂载点，给出修复建议
+```
+
+## 手动向导（可选）
 
 ```bash
 python feishu_dav.py            # 无配置时自动进入向导
