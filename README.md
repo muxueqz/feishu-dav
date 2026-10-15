@@ -34,6 +34,15 @@ python feishu_dav.py --init \
 python feishu_dav.py --doctor   # 检查配置/凭证/挂载点，给出修复建议
 ```
 
+SSH/headless 场景：加 `--no-browser` 只打印授权链接（可复制到本机浏览器或手机飞书扫码打开）。
+
+授权采用 **OAuth Device Flow（RFC 8628）**：无需在开放平台配置重定向 URL，用户在任意设备打开链接、输入用户码（或扫码）即可。
+
+## 故障排查
+
+- **授权超时**：链接有效期约 4 分钟，超时后重跑 `--init` 即可
+- **某些 scope 未生效**：PersonalAgent 自动创建的应用若缺少 drive 权限，到[开发者后台](https://open.feishu.cn/app)对应应用的「权限管理」开通后重新授权
+
 ## 手动向导（可选）
 
 ```bash

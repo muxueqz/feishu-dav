@@ -10,20 +10,17 @@
 """
 
 import argparse
+import base64
 import getpass
 import json
 import mimetypes
 import os
 import re
-import secrets
-import stat
 import sys
 import tempfile
 import threading
 import time
-import urllib.parse
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
@@ -62,30 +59,7 @@ def save_config(cfg, path=CONFIG_PATH):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
-# ---------------------------------------------------------------- oauth wizard
-
-class _OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """本地回调：捕获 ?code= 与 ?state=。"""
-
-    code = None
-    state = None
-    error = None
-
-    def do_GET(self):
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        _OAuthCallbackHandler.code = (q.get("code") or [None])[0]
-        _OAuthCallbackHandler.state = (q.get("state") or [None])[0]
-        _OAuthCallbackHandler.error = (q.get("error") or [None])[0]
-        body = b"<h2>feishu-dav: authorization received, you can close this page.</h2>"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
+# ---------------------------------------------------------------- oauth (device flow, RFC 8628)
 
 def _exchange_token(cfg, payload):
     """POST /authen/v2/oauth/token，返回完整响应 dict 或抛 RuntimeError。"""
@@ -95,52 +69,83 @@ def _exchange_token(cfg, payload):
         timeout=30,
     )
     data = r.json()
-    if data.get("code") != 0:
+    if data.get("code") not in (0, None):
         raise RuntimeError(f"oauth token 接口失败: {data}")
     return data
 
 
-def oauth_authorize(cfg, redirect_port):
-    """跑一次授权码流程，返回 {access_token, refresh_token, expires_in}。"""
-    state = secrets.token_urlsafe(16)
-    redirect_uri = f"http://127.0.0.1:{redirect_port}/callback"
-    params = {
-        "app_id": cfg["app_id"],
-        "redirect_uri": redirect_uri,
-        "state": state,
-        "scope": OAUTH_SCOPES,
-    }
-    url = f"{AUTH_BASE}/open-apis/authen/v1/authorize?{urllib.parse.urlencode(params)}"
+def _print_verify_link(url, user_code, expires_in):
+    print("\n" + "=" * 70)
+    print("请在浏览器中打开以下链接完成授权（可复制到任意设备，支持手机飞书扫码）:")
+    print(f"\n{url}\n")
+    if user_code:
+        print(f"用户码（若页面要求输入）: {user_code}")
+    print(f"有效期: {expires_in} 秒")
+    print("=" * 70)
 
-    server = HTTPServer(("127.0.0.1", redirect_port), _OAuthCallbackHandler)
-    server.timeout = 300
-    print(f"\n浏览器即将打开授权页面（若未打开请手动访问）:\n  {url}\n")
-    webbrowser.open(url)
-    print("等待授权回调（最多 300 秒）...")
-    while _OAuthCallbackHandler.code is None and _OAuthCallbackHandler.error is None:
-        server.handle_request()
-    server.server_close()
 
-    if _OAuthCallbackHandler.error:
-        raise RuntimeError(f"授权失败: {_OAuthCallbackHandler.error}")
-    if _OAuthCallbackHandler.state != state:
-        raise RuntimeError("state 校验失败（可能的 CSRF），请重试")
-    code = _OAuthCallbackHandler.code
-    if not code:
-        raise RuntimeError("未收到授权码，请重试")
+def oauth_authorize(cfg, no_browser=False):
+    """Device Flow 授权（无需重定向 URL），返回 {access_token, refresh_token, expire_at}。"""
+    r = requests.post(
+        f"{AUTH_BASE}/oauth/v1/device_authorization",
+        data={"client_id": cfg["app_id"], "scope": OAUTH_SCOPES},
+        headers={"Authorization": "Basic " + base64.b64encode(
+            f"{cfg['app_id']}:{cfg['app_secret']}".encode()).decode()},
+        timeout=30,
+    )
+    try:
+        dev = r.json()
+    except ValueError:
+        raise RuntimeError(f"device_authorization 请求失败: HTTP {r.status_code} {r.text[:200]}")
+    if r.status_code >= 400 or dev.get("error"):
+        raise RuntimeError(f"device_authorization 失败: {dev.get('error_description') or dev}")
+    device_code = dev["device_code"]
+    user_code = dev.get("user_code", "")
+    interval = int(dev.get("interval") or 5)
+    expires_in = int(dev.get("expires_in") or 240)
+    verify_url = dev.get("verification_uri_complete") or dev.get("verification_uri") \
+        or f"{AUTH_BASE}/oauth/v1/device/verify?user_code={user_code}"
 
-    data = _exchange_token(cfg, {
-        "grant_type": "authorization_code",
-        "client_id": cfg["app_id"],
-        "client_secret": cfg["app_secret"],
-        "code": code,
-        "redirect_uri": redirect_uri,
-    })
-    return {
-        "access_token": data["access_token"],
-        "refresh_token": data["refresh_token"],
-        "expire_at": time.time() + int(data.get("expires_in", 6900)),
-    }
+    _print_verify_link(verify_url, user_code, expires_in)
+    if not no_browser:
+        try:
+            opened = webbrowser.open(verify_url)
+        except Exception:  # noqa: BLE001
+            opened = False
+        if not opened:
+            print("无法自动打开浏览器，请复制上方链接手动打开")
+
+    deadline = time.time() + expires_in
+    wait = False
+    while time.time() < deadline:
+        if wait:
+            time.sleep(interval)
+        wait = True
+        try:
+            data = _exchange_token(cfg, {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+                "client_id": cfg["app_id"],
+                "client_secret": cfg["app_secret"],
+            })
+        except RuntimeError:
+            continue  # code != 0 的响应仍可能是 pending，看下面的 error 字段
+        err = data.get("error")
+        if err == "authorization_pending":
+            print(".", end="", flush=True)
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err:
+            raise RuntimeError(f"授权失败: {data.get('error_description') or err}")
+        print("\n✓ 授权成功")
+        return {
+            "access_token": data["access_token"],
+            "refresh_token": data["refresh_token"],
+            "expire_at": time.time() + int(data.get("expires_in", 6900)),
+        }
+    raise RuntimeError("授权超时（device_code 已过期），请重试")
 
 
 def run_wizard(cfg_path=CONFIG_PATH, prefill=None):
@@ -183,8 +188,8 @@ def run_wizard(cfg_path=CONFIG_PATH, prefill=None):
         cfg["read_only"] = input("只读模式? [y/N]: ").strip().lower() == "y"
         cfg["allow_delete"] = input("允许删除/移动? [y/N]: ").strip().lower() == "y"
 
-    print("\n开始 OAuth 授权（将打开浏览器）...")
-    tok = oauth_authorize(cfg, redirect_port=cfg.get("redirect_port", 8577))
+    print("\n开始 OAuth 授权...")
+    tok = oauth_authorize(cfg, no_browser=prefill.get("no_browser", False))
     cfg["tokens"] = tok
     save_config(cfg, cfg_path)
     print(f"\n配置已保存到 {cfg_path}，自动验证访问权限...")
@@ -227,6 +232,64 @@ def _detect_lark_cli_credential():
     return None
 
 
+def _register_app(brand_host="accounts.feishu.cn", open_host="https://open.feishu.cn",
+                  no_browser=False):
+    """对标 lark-cli config create-app：Device Flow 自动创建 PersonalAgent 应用。
+    返回 {app_id, app_secret}。"""
+    ep = f"https://{brand_host}/oauth/v1/app/registration"
+    form = {
+        "action": "begin",
+        "archetype": "PersonalAgent",
+        "auth_method": "client_secret",
+        "request_user_info": "open_id tenant_brand",
+    }
+    r = requests.post(ep, data=form, timeout=30)
+    data = r.json()
+    if r.status_code >= 400 or data.get("error") or not data.get("device_code"):
+        raise RuntimeError(f"应用注册 begin 失败: {data.get('error_description') or data}")
+    user_code = data.get("user_code", "")
+    device_code = data["device_code"]
+    interval = int(data.get("interval") or 5)
+    expires_in = int(data.get("expire_in") or data.get("expires_in") or 600)
+    verify_url = f"{open_host}/page/cli?user_code={user_code}" if user_code \
+        else data.get("verification_uri_complete") or data.get("verification_uri")
+
+    print("\n将为你自动创建一个飞书应用（PersonalAgent 类型）。")
+    _print_verify_link(verify_url, user_code, expires_in)
+    if not no_browser:
+        try:
+            webbrowser.open(verify_url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    deadline = time.time() + expires_in
+    wait = False
+    while time.time() < deadline:
+        if wait:
+            time.sleep(interval)
+        wait = True
+        r = requests.post(ep, data={"action": "poll", "device_code": device_code}, timeout=30)
+        try:
+            data = r.json()
+        except ValueError:
+            continue
+        err = data.get("error")
+        if err == "authorization_pending":
+            print(".", end="", flush=True)
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err:
+            raise RuntimeError(f"应用注册失败: {data.get('error_description') or err}")
+        client_id, client_secret = data.get("client_id"), data.get("client_secret")
+        if client_id and client_secret:
+            print(f"\n✓ 应用创建成功 (app_id={client_id})")
+            return {"app_id": client_id, "app_secret": client_secret}
+        # 凭证未齐：继续轮询
+    raise RuntimeError("应用注册超时，请重试或手动输入 app_id/app_secret")
+
+
 def run_init(cfg_path=CONFIG_PATH, prefill=None):
     """larkfs init 风格的自动引导：
     1. 检查已有配置 / 探测凭证来源（lark-cli 配置、环境变量、命令行参数、交互输入）
@@ -256,18 +319,24 @@ def run_init(cfg_path=CONFIG_PATH, prefill=None):
                 if use == "n":
                     cred = None
         if cred is None:
-            print("\n未检测到可用凭证。请到飞书开发者后台创建自建应用并开通 drive 权限:")
-            print("  https://open.feishu.cn/app  → 创建企业自建应用 → 权限管理开通 drive 相关 scope → 发布")
-            cred = {
-                "app_id": input("app_id: ").strip(),
-                "app_secret": getpass.getpass("app_secret: ").strip(),
-            }
-            if not cred["app_id"] or not cred["app_secret"]:
-                sys.exit("app_id / app_secret 不能为空")
+            # 无任何现成凭证：优先尝试 Device Flow 自动创建应用（对标 lark-cli create-app）
+            try:
+                cred = _register_app(no_browser=prefill.get("no_browser", False))
+                cred["source"] = "自动创建（PersonalAgent）"
+            except (RuntimeError, requests.RequestException) as e:
+                print(f"· 自动创建应用不可用（{e}）")
+                print("\n请到飞书开发者后台创建自建应用并开通 drive 权限:")
+                print("  https://open.feishu.cn/app  → 创建企业自建应用 → 权限管理开通 drive 相关 scope → 发布")
+                cred = {
+                    "app_id": input("app_id: ").strip(),
+                    "app_secret": getpass.getpass("app_secret: ").strip(),
+                }
+                if not cred["app_id"] or not cred["app_secret"]:
+                    sys.exit("app_id / app_secret 不能为空")
         cfg["app_id"], cfg["app_secret"] = cred["app_id"], cred["app_secret"]
         print(f"✓ 使用应用凭证 (app_id={cfg['app_id']}, 来源: {cred.get('source', '交互输入')})")
 
-    # --- step 2: 授权 ---
+    # --- step 2: 授权（Device Flow，无需重定向 URL）---
     tok = cfg.get("tokens") or {}
     if tok.get("refresh_token"):
         ok, msg = check_drive_access(cfg)
@@ -275,10 +344,10 @@ def run_init(cfg_path=CONFIG_PATH, prefill=None):
             print(f"✓ 已有授权且可用: {msg}")
         else:
             print(f"· 已有授权但不可用（{msg}），重新授权...")
-            cfg["tokens"] = oauth_authorize(cfg, redirect_port=cfg.get("redirect_port", 8577))
+            cfg["tokens"] = oauth_authorize(cfg, no_browser=prefill.get("no_browser", False))
     else:
-        print("· 尚未授权，开始 OAuth（将打开浏览器）...")
-        cfg["tokens"] = oauth_authorize(cfg, redirect_port=cfg.get("redirect_port", 8577))
+        print("· 尚未授权，开始 Device Flow 授权...")
+        cfg["tokens"] = oauth_authorize(cfg, no_browser=prefill.get("no_browser", False))
 
     # --- step 3: 挂载点（非交互来源或保留现状）---
     mounts = prefill.get("mounts")
@@ -643,6 +712,11 @@ class FeishuCollection(DAVCollection):
 
     def _members(self):
         ft = self.entry["token"] if self.entry else None
+        if self.entry is None and self.provider.cfg.get("mounts"):
+            # 配置了挂载点：根目录只展示挂载点
+            return {m["name"]: {"token": m["token"], "name": m["name"], "type": "folder",
+                                "size": 0, "mtime": 0, "url": ""}
+                    for m in self.provider.cfg["mounts"]}
         return self.provider.members(ft)
 
     def get_member_names(self):
@@ -686,6 +760,13 @@ class FeishuCollection(DAVCollection):
         self.client.delete(self.entry)
 
 
+EXTRA_MIME = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".md": "text/markdown",
+}
+
+
 class FeishuFile(DAVNonCollection):
     """文件或在线文档（只读虚拟文件）。pending_* 用于 PUT 新文件的延迟上传。"""
 
@@ -717,7 +798,8 @@ class FeishuFile(DAVNonCollection):
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         if self.entry and self.entry["type"] in FeishuClient.EXPORTABLE:
             ext = FeishuClient.EXPORTABLE[self.entry["type"]]
-        return mimetypes.types_map.get("." + ext, "application/octet-stream")
+        mime = mimetypes.types_map.get("." + ext) or EXTRA_MIME.get("." + ext)
+        return mime or "application/octet-stream"
 
     def get_etag(self):
         return (self.entry or {}).get("token") or "pending"
@@ -729,6 +811,9 @@ class FeishuFile(DAVNonCollection):
         return (self.entry or {}).get("mtime") or None
 
     def support_ranges(self):
+        return False
+
+    def support_etag(self):
         return False
 
     def get_content(self, dest_file):
@@ -820,7 +905,8 @@ class FeishuProvider(DAVProvider):
             ft = entry["token"] if entry["type"] == "folder" else None
             if i < len(rest) - 1 and entry["type"] != "folder":
                 raise FeishuError(f"路径不存在: {'/'.join(parts)}", status=404, code=404)
-        return cur, mount, bool(cur and cur["type"] == "folder")
+        # cur 为空时（根目录或挂载点本身）都是目录
+        return cur, mount, cur is None or cur["type"] == "folder"
 
     def _find(self, folder_token, name):
         members = self.members(folder_token)
@@ -846,8 +932,12 @@ class FeishuProvider(DAVProvider):
             if e.status == 404:
                 return None
             raise DAVError(e.status if 400 <= e.status < 500 else 502) from e
-        if entry is None:  # 根目录
-            return FeishuCollection("/", environ, self)
+        if entry is None:  # 根目录或挂载点本身
+            if mount:
+                entry = {"token": mount["token"], "name": mount["name"], "type": "folder",
+                         "size": 0, "mtime": 0, "url": ""}
+            else:
+                return FeishuCollection("/", environ, self)
         full = "/" + "/".join(_split_path(path))
         if is_folder:
             return FeishuCollection(full, environ, self, entry)
@@ -903,6 +993,8 @@ def main():
     ap.add_argument("--app-secret", help="非交互配置：自建应用 app_secret（也可用环境变量 FEISHU_APP_SECRET）")
     ap.add_argument("--mount", action="append", metavar="NAME:FOLDER_TOKEN",
                     help="非交互配置：额外挂载点，可多次")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="授权时不尝试打开浏览器，仅打印链接（SSH/headless 场景）")
     ap.add_argument("--read-only", action="store_true", help="覆盖配置为只读")
     ap.add_argument("--allow-delete", action="store_true", help="覆盖配置允许删除")
     ap.add_argument("--config", default=CONFIG_PATH)
@@ -925,6 +1017,7 @@ def main():
             "mounts": mounts,
             "read_only": True if args.read_only else None,
             "allow_delete": True if args.allow_delete else None,
+            "no_browser": args.no_browser,
         }))
     if args.wizard or cfg is None:
         mounts = None
@@ -939,6 +1032,7 @@ def main():
             "mounts": mounts,
             "read_only": True if args.read_only else None,
             "allow_delete": True if args.allow_delete else None,
+            "no_browser": args.no_browser,
         })
         cfg = load_config(args.config)
     if args.read_only:
