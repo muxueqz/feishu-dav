@@ -95,7 +95,8 @@ def main():
     # --- 2. PROPFIND 列目录 ---
     root = provider.get_resource_inst("/", ENV)
     names = root.get_member_names()
-    assert names == ["Shared"], names  # 配置挂载点后根目录只显示挂载点
+    # 根目录 = 我的云空间内容 + 挂载点（同名挂载点优先）
+    assert "Shared" in names and "hello.txt" in names and "在线文档" in names and "docs" in names, names
     sub = provider.get_resource_inst("/Shared", ENV)
     sub_names = sub.get_member_names()
     assert "inner.txt" in sub_names and "在线文档" in sub_names, sub_names
@@ -104,7 +105,7 @@ def main():
     assert sub_members["inner.txt"].get_content_type() == "text/plain"
     assert sub_members["在线文档"].get_content_length() == len(b"EXPORTED-DOCX")
     assert "officedocument" in sub_members["在线文档"].get_content_type()
-    print(f"✓ 根目录=挂载点 {names}，挂载点列取: {sub_names}")
+    print(f"✓ 根目录(云空间+挂载点): {names}，挂载点内: {sub_names}")
 
     # --- 2b. 无挂载点时根目录 = 我的云空间 ---
     no_mount_provider = FeishuProvider(fake, {"mounts": [], "read_only": False, "allow_delete": True})

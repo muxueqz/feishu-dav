@@ -33,12 +33,21 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 # 需要 user_access_token 具备的 OAuth scope（offline_access 用于刷新）
 OAUTH_SCOPES = " ".join([
     "offline_access",
+    "auth:user.id:read",
     "drive:drive:readonly",
     "drive:drive",
     "drive:file:upload",
     "drive:file:download",
+    "drive:drive.metadata:readonly",
+    "docs:document.media:download",
+    "docs:document.media:upload",
     "docs:document:export",
+    "docs:document:readonly",
+    "docx:document:readonly",
+    "docx:document:create",
     "space:folder:create",
+    "space:document:move",
+    "search:docs:read",
 ])
 
 TOKEN_EXPIRE_MARGIN = 300  # 过期前 5 分钟开始刷新
@@ -85,20 +94,43 @@ def _print_verify_link(url, user_code, expires_in):
     print("=" * 70)
 
 
-def oauth_authorize(cfg, no_browser=False):
-    """Device Flow 授权（无需重定向 URL），返回 {access_token, refresh_token, expire_at}。"""
+def _device_authorization(cfg, scope):
     r = requests.post(
         f"{AUTH_BASE}/oauth/v1/device_authorization",
-        data={"client_id": cfg["app_id"], "scope": OAUTH_SCOPES},
+        data={"client_id": cfg["app_id"], "scope": scope},
         headers={"Authorization": "Basic " + base64.b64encode(
             f"{cfg['app_id']}:{cfg['app_secret']}".encode()).decode()},
         timeout=30,
     )
     try:
-        dev = r.json()
+        return r.json(), r.status_code
     except ValueError:
         raise RuntimeError(f"device_authorization 请求失败: HTTP {r.status_code} {r.text[:200]}")
-    if r.status_code >= 400 or dev.get("error"):
+
+
+def _is_scope_error(dev):
+    desc = str(dev.get("error_description") or "") + str(dev.get("error") or "")
+    return "scope" in desc.lower() and ("invalid" in desc.lower() or "malformed" in desc.lower())
+
+
+def oauth_authorize(cfg, no_browser=False):
+    """Device Flow 授权（无需重定向 URL），返回 {access_token, refresh_token, expire_at}。
+
+    应用不支持请求中的某些 scope 时，自动逐个探测并剔除无效项后重试。
+    """
+    dev, status = _device_authorization(cfg, OAUTH_SCOPES)
+    if (status >= 400 or dev.get("error")) and _is_scope_error(dev):
+        print("· 部分 scope 该应用不支持，自动筛选有效 scope...")
+        accepted = []
+        for s in OAUTH_SCOPES.split():
+            d, st = _device_authorization(cfg, s)
+            if not (st >= 400 or d.get("error")):
+                accepted.append(s)
+        if not accepted:
+            raise RuntimeError("该应用不支持任何请求的 scope")
+        dev, status = _device_authorization(cfg, " ".join(accepted))
+        print(f"· 有效 scope: {' '.join(accepted)}")
+    if status >= 400 or dev.get("error") or not dev.get("device_code"):
         raise RuntimeError(f"device_authorization 失败: {dev.get('error_description') or dev}")
     device_code = dev["device_code"]
     user_code = dev.get("user_code", "")
@@ -713,11 +745,14 @@ class FeishuCollection(DAVCollection):
 
     def _members(self):
         ft = self.entry["token"] if self.entry else None
-        if self.entry is None and self.provider.cfg.get("mounts"):
-            # 配置了挂载点：根目录只展示挂载点
-            return {m["name"]: {"token": m["token"], "name": m["name"], "type": "folder",
-                                "size": 0, "mtime": 0, "url": ""}
-                    for m in self.provider.cfg["mounts"]}
+        if self.entry is None:
+            members = self.provider.members(None)
+            for m in self.provider.cfg.get("mounts") or []:
+                # 挂载点与云空间根内容合并；同名时挂载点优先
+                if m["name"] not in members:
+                    members[m["name"]] = {"token": m["token"], "name": m["name"],
+                                          "type": "folder", "size": 0, "mtime": 0, "url": ""}
+            return members
         return self.provider.members(ft)
 
     def get_member_names(self):
