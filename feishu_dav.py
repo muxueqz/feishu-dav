@@ -713,23 +713,29 @@ class FeishuClient:
         return data["data"]["file_token"]
 
     def _upload_split(self, folder_token, filename, path, size):
-        block = 4 << 20
-        block_num = (size + block - 1) // block
-        r = self._request("POST", "/open-apis/drive/v1/files/upload_prepare",
+        """对齐 lark-cli 的 /files 三步分片协议：
+        prepare 只带 file_name/parent_type/parent_node/size，由服务端返回 block_size/block_num；
+        part 表单字段为 upload_id/seq(0-based)/size(本片实际字节数)。
+        """
+        base = "/open-apis/drive/v1"
+        r = self._request("POST", f"{base}/files/upload_prepare",
                           json={"file_name": filename, "parent_type": "explorer",
-                                "parent_node": folder_token or "", "size": size,
-                                "block_num": block_num})
-        upload_id = r.json()["data"]["upload_id"]
+                                "parent_node": folder_token or "", "size": size})
+        data = r.json()["data"]
+        block_size = int(data["block_size"])
+        block_num = int(data["block_num"])
+        upload_id = data["upload_id"]
         with open(path, "rb") as f:
-            for i in range(block_num):
-                chunk = f.read(block)
+            for seq in range(block_num):
+                chunk = f.read(block_size)
+                if not chunk:
+                    break
                 self._request(
-                    "POST", "/open-apis/drive/v1/files/upload_part",
-                    data={"upload_id": upload_id, "block_num": str(i),
-                          "block_size": str(len(chunk))},
+                    "POST", f"{base}/files/upload_part",
+                    data={"upload_id": upload_id, "seq": str(seq), "size": str(len(chunk))},
                     files={"file": (filename, chunk, "application/octet-stream")},
                 )
-        r = self._request("POST", "/open-apis/drive/v1/files/upload_finish",
+        r = self._request("POST", f"{base}/files/upload_finish",
                           json={"upload_id": upload_id, "block_num": block_num})
         self.invalidate_dir(folder_token)
         return r.json()["data"]["file_token"]
