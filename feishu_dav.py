@@ -457,28 +457,74 @@ def run_doctor(cfg_path=CONFIG_PATH):
 # ---------------------------------------------------------------- token manager
 
 class TokenManager:
-    """管理 user_access_token：缓存、过期前刷新、401 强制刷新。"""
+    """管理 user_access_token：v3 端点 + DPoP proof 刷新（对齐 lark-cli 行为）。"""
 
     def __init__(self, cfg, cfg_path=CONFIG_PATH):
         self.cfg = cfg
         self.cfg_path = cfg_path
+        self._key = None
 
     def _tokens(self):
         return self.cfg.setdefault("tokens", {})
 
+    def _dpop_key(self):
+        """加载或生成 DPoP 签名钥匙（P-256，持久化在配置中保证绑定一致）。"""
+        if self._key is not None:
+            return self._key
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        pem = self.cfg.get("dpop_key")
+        if pem:
+            self._key = serialization.load_pem_private_key(pem.encode(), password=None)
+        else:
+            self._key = ec.generate_private_key(ec.SECP256R1())
+            self.cfg["dpop_key"] = self._key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption()).decode()
+            save_config(self.cfg, self.cfg_path)
+        return self._key
+
+    def dpop_proof(self, htm, htu):
+        """构造 DPoP proof（RFC 9449 风格 compact JWS，ES256 + P-256 JWK）。"""
+        import uuid as _uuid
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        key = self._dpop_key()
+        nums = key.public_key().public_numbers()
+        b64u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+        jwk = {"kty": "EC", "crv": "P-256",
+               "x": b64u(nums.x.to_bytes(32, "big")),
+               "y": b64u(nums.y.to_bytes(32, "big"))}
+        header = {"typ": "dpop+jwt", "alg": "ES256", "jwk": jwk}
+        claims = {"jti": str(_uuid.uuid4()), "htm": htm.upper(), "htu": htu, "iat": int(time.time())}
+        h = b64u(json.dumps(header, separators=(",", ":")).encode())
+        c = b64u(json.dumps(claims, separators=(",", ":")).encode())
+        sig = key.sign((h + "." + c).encode(), ec.ECDSA(hashes.SHA256()))
+        return h + "." + c + "." + b64u(sig[:32] + sig[32:])
+
     def _refresh(self):
         tok = self._tokens()
         if not tok.get("refresh_token"):
-            raise RuntimeError("没有 refresh_token，请运行: python feishu_dav.py --wizard")
-        data = _exchange_token(self.cfg, {
-            "grant_type": "refresh_token",
-            "client_id": self.cfg["app_id"],
-            "client_secret": self.cfg["app_secret"],
-            "refresh_token": tok["refresh_token"],
-        })
+            raise RuntimeError("没有 refresh_token，请运行: python feishu_dav.py --init")
+        # 对齐 lark-cli：token 端点在 accounts 域的 v3 路径，请求携带 DPoP proof
+        htu = f"{AUTH_BASE}/oauth/v3/token"
+        r = requests.post(htu,
+            data={"grant_type": "refresh_token", "client_id": self.cfg["app_id"],
+                  "client_secret": self.cfg["app_secret"], "refresh_token": tok["refresh_token"]},
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "DPoP": self.dpop_proof("POST", htu)},
+            timeout=30)
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"token 刷新失败: HTTP {r.status_code} {r.text[:200]}")
+        if r.status_code != 200 or not data.get("access_token"):
+            raise RuntimeError(f"token 刷新失败: {data.get('error_description') or data}")
         tok["access_token"] = data["access_token"]
-        tok["refresh_token"] = data.get("refresh_token", tok["refresh_token"])
+        tok["refresh_token"] = data.get("refresh_token", tok["refresh_token"])  # v3 会轮换 refresh_token
         tok["expire_at"] = time.time() + int(data.get("expires_in", 6900))
+        tok["scope"] = data.get("scope", tok.get("scope", ""))
         save_config(self.cfg, self.cfg_path)
 
     def access_token(self, force=False):
@@ -517,6 +563,10 @@ class FeishuClient:
         url = path if path.startswith("http") else OPEN_BASE + path
         headers = kw.pop("headers", {})
         headers["Authorization"] = f"Bearer {self.tm.access_token()}"
+        try:
+            headers["DPoP"] = self.tm.dpop_proof(method, url)
+        except Exception:
+            pass  # DPoP 不可用时退化为纯 Bearer
         r = requests.request(method, url, headers=headers, timeout=120, **kw)
         if r.status_code == 401 and retry_auth:
             self.tm.invalidate()
@@ -708,8 +758,7 @@ class FeishuClient:
             result = r.json()["data"]["result"]
             if result.get("job_status", 0) == 0:  # 0 = success
                 dl = self._request("GET",
-                                   f"/open-apis/drive/v1/export_tasks/{ticket}/download",
-                                   params={"token": entry["token"]})
+                                   f"/open-apis/drive/v1/export_tasks/file/{entry['token']}/download")
                 with open(cache_path, "wb") as f:
                     for chunk in dl.iter_content(1 << 20):
                         f.write(chunk)
