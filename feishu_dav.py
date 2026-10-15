@@ -1007,8 +1007,7 @@ class FeishuProvider(DAVProvider):
         rest = list(parts[1:]) if mount else list(parts)
         cur = None
         ft = mount["token"] if mount else None
-        if not mount and self.cfg.get("mounts"):
-            raise FeishuError(f"未挂载: {parts[0]}", status=404, code=404)
+        # 首段不是挂载点名时，回落到自己的云空间根目录解析（根目录是「云空间+挂载点」合并视图）
         for i, name in enumerate(rest):
             entry = self._find(ft, name)
             if entry is None:
