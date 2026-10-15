@@ -653,10 +653,33 @@ class FeishuClient:
     # ---- 读写 ----
 
     def download(self, file_token, chunk_size=1 << 20):
-        """流式下载 file，返回 requests 响应（可 iter_content）。"""
+        """流式下载 file，返回 requests 响应（可 iter_content）。
+
+        注意：对齐 lark-cli，使用 /files/{token}/download —— /medias/{token}/download
+        对 PersonalAgent 等部分应用会返回 403（空响应体）。
+        """
         return self._request(
-            "GET", f"/open-apis/drive/v1/medias/{file_token}/download", stream=True
+            "GET", f"/open-apis/drive/v1/files/{file_token}/download", stream=True
         )
+
+    _size_cache = {}
+
+    def file_size(self, file_token):
+        """懒加载文件真实大小：list API 不返回 size，用 Range 0-0 从 Content-Range 取。"""
+        if file_token in FeishuClient._size_cache:
+            return FeishuClient._size_cache[file_token]
+        url = f"{OPEN_BASE}/open-apis/drive/v1/files/{file_token}/download"
+        r = self._request("GET", url, headers={"Range": "bytes=0-0"}, stream=True)
+        r.close()
+        total = None
+        cr = r.headers.get("Content-Range", "")
+        if "/" in cr:
+            try:
+                total = int(cr.rsplit("/", 1)[1])
+            except ValueError:
+                total = None
+        FeishuClient._size_cache[file_token] = total
+        return total
 
     def upload(self, folder_token, filename, data_or_path, size):
         """上传文件到指定文件夹。<=20MB 走 upload_all；更大走分片。"""
@@ -876,7 +899,12 @@ class FeishuFile(DAVNonCollection):
                 return len(blob)
             except FeishuError:
                 return 0
-        return self.entry["size"]
+        size = self.entry.get("size") or 0
+        if not size and self.entry["type"] == "file":
+            # list API 不返回 size，懒加载真实大小（Range 0-0）
+            size = self.client.file_size(self.entry["token"]) or 0
+            self.entry["size"] = size
+        return size
 
     def get_content_type(self):
         name = self.pending_name or (self.entry or {}).get("name", "")
@@ -897,6 +925,11 @@ class FeishuFile(DAVNonCollection):
 
     def support_ranges(self):
         return False
+
+    def support_content_length(self):
+        # 飞书 list API 不返回 size；size 未知时不声明 Content-Length，
+        # 避免 wsgidav 按 0 长度发空响应（改为流式读到 EOF）
+        return bool(self.get_content_length())
 
     def support_etag(self):
         return False
@@ -949,7 +982,7 @@ class FeishuFile(DAVNonCollection):
 
 
 class _AutoDeleteReader:
-    """包装临时文件：close 时自动删除磁盘副本。"""
+    """包装临时文件：支持 read/迭代（wsgidav 按 iterable 消费），close 时自动删除磁盘副本。"""
 
     def __init__(self, path):
         self._f = open(path, "rb")
@@ -957,6 +990,15 @@ class _AutoDeleteReader:
 
     def read(self, *a):
         return self._f.read(*a)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self._f.readline()
+        if not line:
+            raise StopIteration
+        return line
 
     def close(self):
         try:
