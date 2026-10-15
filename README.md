@@ -40,8 +40,9 @@ SSH/headless 场景：加 `--no-browser` 只打印授权链接（可复制到本
 
 ## 故障排查
 
+- **文件大小显示为 0**：飞书 `drive/v1/files` 列表接口不返回 size 字段，PROPFIND 只能报 0；不影响实际读取/下载（rclone 流式传输按实际内容计）。上传后的文件大小正常
 - **授权超时**：链接有效期约 4 分钟，超时后重跑 `--init` 即可
-- **某些 scope 未生效**：PersonalAgent 自动创建的应用若缺少 drive 权限，到[开发者后台](https://open.feishu.cn/app)对应应用的「权限管理」开通后重新授权
+- **部分文件下载 403**：自动创建的 PersonalAgent 应用默认没有 drive 权限。两种解决办法：到[开发者后台](https://open.feishu.cn/app)给该应用「权限管理」开通 drive 相关 scope；或在 `~/.feishu-dav/config.json` 里把 `app_id/app_secret` 换成已有权限的应用（如 lark-cli 的），删除 `tokens` 字段后重新 `--init`
 
 ## 手动向导（可选）
 

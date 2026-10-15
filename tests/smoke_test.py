@@ -114,11 +114,12 @@ def main():
 
     # --- 3. 下载（普通文件 + 在线文档导出）---
     buf = io.BytesIO()
-    provider.get_resource_inst("/Shared/inner.txt", ENV).get_content(buf)
-    assert buf.getvalue() == b"abc"
-    buf2 = io.BytesIO()
-    provider.get_resource_inst("/Shared/在线文档", ENV).get_content(buf2)
-    assert buf2.getvalue() == b"EXPORTED-DOCX"
+    provider.get_resource_inst("/Shared/inner.txt", ENV).get_content().read() == b"abc"
+    buf = io.BytesIO()
+    got = provider.get_resource_inst("/Shared/inner.txt", ENV).get_content().read()
+    assert got == b"abc", got
+    got2 = provider.get_resource_inst("/Shared/在线文档", ENV).get_content().read()
+    assert got2 == b"EXPORTED-DOCX", got2
     print("✓ 下载文件与在线文档导出")
 
     # --- 4. PUT 上传链路 ---

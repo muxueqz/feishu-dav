@@ -12,6 +12,7 @@
 import argparse
 import base64
 import getpass
+import io
 import json
 import mimetypes
 import os
@@ -816,16 +817,23 @@ class FeishuFile(DAVNonCollection):
     def support_etag(self):
         return False
 
-    def get_content(self, dest_file):
+    def get_content(self):
+        """wsgidav 4.x 契约：无参，返回可迭代的文件对象。"""
         if self.entry is None:
-            return
+            return io.BytesIO(b"")
         if self.entry["type"] in FeishuClient.EXPORTABLE:
             _, blob = self.client.export_content(self.entry)
-            dest_file.write(blob)
-            return
+            return io.BytesIO(blob)
         r = self.client.download(self.entry["token"])
-        for chunk in r.iter_content(1 << 20):
-            dest_file.write(chunk)
+        fd, tmp = tempfile.mkstemp(prefix="feishu-dav-dl-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+        except Exception:
+            os.unlink(tmp)
+            raise
+        return _AutoDeleteReader(tmp)
 
     def begin_write(self, *, content_type=None, content_encoding=None):
         if self.provider.readonly:
@@ -854,6 +862,26 @@ class FeishuFile(DAVNonCollection):
         if not self.provider.allow_delete or self.entry is None:
             raise DAVError(HTTP_FORBIDDEN)
         self.client.delete(self.entry)
+
+
+class _AutoDeleteReader:
+    """包装临时文件：close 时自动删除磁盘副本。"""
+
+    def __init__(self, path):
+        self._f = open(path, "rb")
+        self._path = path
+
+    def read(self, *a):
+        return self._f.read(*a)
+
+    def close(self):
+        try:
+            self._f.close()
+        finally:
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
 
 
 class FeishuProvider(DAVProvider):
