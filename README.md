@@ -1,26 +1,41 @@
 # feishu-dav
 
-把飞书云盘（Drive）通过 WebDAV 暴露为 HTTP 服务，配合 `rclone mount` 挂载到 Linux。
-纯 OAuth `user_access_token` 直连飞书开放平台，不依赖 lark-cli。单文件实现（`feishu_dav.py`）。
+[English](README.md) | [中文](README.zh.md)
 
-## 安装
+Mount Feishu (Lark) Drive as a local filesystem via WebDAV — a single-file Python server with OAuth Device Flow, auto app provisioning, and rclone-compatible mounting. No redirect URLs, no lark-cli.
+
+## Features
+
+- **Single file** (`feishu_dav.py`) — depends only on `wsgidav`, `cheroot`, `requests` (+ `cryptography` for DPoP)
+- **OAuth Device Flow (RFC 8628)** — authorize from any device (browser or Feishu mobile scan), no redirect URL configuration
+- **Auto app provisioning** — creates a PersonalAgent app for you via device flow, larkfs-style
+- **`--init` guided setup / `--doctor` self-check** — credential detection (CLI args → env vars → lark-cli config → interactive), automatic access verification
+- **rclone-compatible** — `rclone mount` with `--vfs-cache-mode writes`; also works with any WebDAV client
+- **Online docs as read-only files** — docx/sheets/bitables/slides exported on the fly and cached
+- **Safe by default** — `--read-only` and delete gating; `~/.feishu-dav/config.json` stored with mode 600
+- **DPoP token refresh** — v3 token endpoint + DPoP proofs, aligned with lark-cli behavior
+- **Chunked upload for large files** — prepare/part/finish protocol matching lark-cli (tested with 70 MB+)
+
+## Installation
 
 ```bash
-pip install wsgidav cheroot requests
+pip install wsgidav cheroot requests cryptography
 ```
 
-## 快速开始（自动引导，推荐）
+## Quick Start
 
 ```bash
 python feishu_dav.py --init
 ```
 
-自动引导流程（larkfs init 风格）：
-1. 检查应用凭证：已有配置直接使用；否则按顺序尝试 命令行参数 `--app-id/--app-secret` → 环境变量 `FEISHU_APP_ID/FEISHU_APP_SECRET` → 自动探测本机 `~/.lark-cli/config.json` 里的应用并询问是否复用 → 最后交互输入（并给出开发者后台创建应用的指引）
-2. 未授权则自动打开浏览器完成 OAuth（本地回调 127.0.0.1:8577）
-3. 自动验证云盘访问权限并保存配置
+The guided setup (larkfs-style):
+1. Resolves app credentials, in order: existing config → `--app-id/--app-secret` → env vars `FEISHU_APP_ID/FEISHU_APP_SECRET` → auto-detected `~/.lark-cli/config.json` (asks to reuse) → auto-creates a PersonalAgent app via device flow → falls back to interactive input
+2. Runs OAuth Device Flow — prints a verification URL + user code, opens the browser when possible
+3. Verifies Drive access automatically and saves the config
 
-非交互式（CI / 脚本）：
+Headless / SSH: add `--no-browser` to only print the link (open it on any device, or scan with the Feishu mobile app).
+
+Non-interactive (CI / scripts):
 
 ```bash
 python feishu_dav.py --init \
@@ -28,44 +43,7 @@ python feishu_dav.py --init \
   --mount Shared:A14LfVzzTlnOftd19MFcbCXsnld --read-only
 ```
 
-自检：
-
-```bash
-python feishu_dav.py --doctor   # 检查配置/凭证/挂载点，给出修复建议
-```
-
-SSH/headless 场景：加 `--no-browser` 只打印授权链接（可复制到本机浏览器或手机飞书扫码打开）。
-
-授权采用 **OAuth Device Flow（RFC 8628）**：无需在开放平台配置重定向 URL，用户在任意设备打开链接、输入用户码（或扫码）即可。
-
-## 故障排查
-
-- **文件大小显示为 0**：飞书 `drive/v1/files` 列表接口不返回 size 字段，PROPFIND 只能报 0；不影响实际读取/下载（rclone 流式传输按实际内容计）。上传后的文件大小正常
-- **授权超时**：链接有效期约 4 分钟，超时后重跑 `--init` 即可
-- **部分文件下载 403（空响应体）**：自动创建的 PersonalAgent 应用即使授权页显示包含 `drive:file:download`，媒体下载接口仍可能返回 403（lark-cli 等后台开通了权限的应用可正常下载）。解决：到[开发者后台](https://open.feishu.cn/app)对应应用 →「权限管理」确认 drive 相关权限已开通 →「版本管理与发布」**创建版本并发布**（仅开通不发布不生效），然后重新 `--init` 授权
-
-## 手动向导（可选）
-
-```bash
-python feishu_dav.py            # 无配置时自动进入向导
-python feishu_dav.py --wizard   # 重新配置
-```
-
-向导流程：
-1. 输入飞书自建应用的 `app_id` / `app_secret`（开发者后台创建，需开通 drive 相关权限并发布应用）
-2. 自动打开浏览器完成 OAuth 授权（本地回调 127.0.0.1:8577），获取并保存 `user_access_token` / `refresh_token`（offline_access，自动刷新）
-3. 可选：填入额外挂载的 folder_token（例如别人共享给你的文件夹 URL 中的 token），多级目录填多个
-4. 选择只读模式 / 是否允许删除
-
-配置保存在 `~/.feishu-dav/config.json`（权限 600，含 token，勿外传）。
-
-## 启动
-
-```bash
-python feishu_dav.py [--host 127.0.0.1] [--port 8765] [--read-only] [--allow-delete]
-```
-
-## 用 rclone 挂载
+### Mount with rclone
 
 ```bash
 rclone config create feishu webdav url=http://127.0.0.1:8765 vendor=other
@@ -73,12 +51,56 @@ mkdir -p ~/feishu
 rclone mount feishu: ~/feishu --vfs-cache-mode writes --daemon
 ```
 
-不带 rclone 也可直接用 WebDAV 客户端或 `rclone lsf feishu:` 浏览。
+## CLI Reference
 
-## 说明
+| Flag | Description |
+|---|---|
+| `--init` | Guided setup + authorization (recommended) |
+| `--wizard` | Interactive setup wizard |
+| `--doctor` | Check config / credentials / mounts, with fix suggestions |
+| `--app-id` / `--app-secret` | Use an existing OAuth app (or env `FEISHU_APP_ID` / `FEISHU_APP_SECRET`) |
+| `--mount NAME:FOLDER_TOKEN` | Mount an extra folder (e.g. shared with you); repeatable |
+| `--no-browser` | Print the verification link only (SSH/headless) |
+| `--read-only` | Reject all write operations |
+| `--allow-delete` | Enable delete/move (off by default) |
+| `--host` / `--port` | Listen address (default `127.0.0.1:8765`) |
 
-- 在线文档（docx/sheet/bitable/slides）映射为只读虚拟文件，内容为导出产物（docx/xlsx/pdf），结果缓存于 `~/.feishu-dav/export_cache/`
-- 同名文件会显示为 `name~token前8位` 以保证路径唯一
-- 目录列表有 60s TTL 缓存；写操作后主动失效
-- 「共享给我」的文件夹：在向导里把其 folder_token 加为挂载点即可（需要应用 scope 覆盖，且你有相应访问权限）
-- 删除操作默认禁止，需 `--allow-delete` 或向导中开启；`--read-only` 时一切写操作返回 403
+## How It Works
+
+A wsgidav `DAVProvider` maps WebDAV operations onto the Feishu Open API with a user access token:
+
+- **PROPFIND** → `GET /drive/v1/files` (paginated, 60 s TTL cache; the root shows your own space plus configured mounts)
+- **GET** → `GET /drive/v1/files/{token}/download` (streamed; the `/medias/...` endpoint is avoided — see troubleshooting)
+- **PUT** → `upload_all` (≤20 MB) or the server-planned prepare/part/finish chunked protocol (`seq` + per-chunk `size`)
+- **docx/sheet/bitable/slides** → exported on demand via export tasks and cached under `~/.feishu-dav/export_cache/`
+- **Token refresh** → accounts endpoint v3 with DPoP proofs (RFC 9449-style, ES256/P-256), refresh tokens rotated automatically
+
+File sizes shown as 0 are a Feishu list-API limitation; real sizes are lazily resolved via a `Range: bytes=0-0` probe and downloads are streamed by content.
+
+## Troubleshooting
+
+- **Sizes show as 0 in listings**: the Feishu list API doesn't return `size`. Downloads/uploads are unaffected (streamed by content).
+- **Authorization timed out**: verification links are short-lived; just rerun `--init`.
+- **Download returns 403 with an empty body**: the auto-created PersonalAgent app may have drive scopes granted but not *published*. In the [developer console](https://open.feishu.cn/app) → your app → **Permissions** (confirm drive scopes) → **Version & Release** (create and publish a version — grants only take effect after publishing), then re-run `--init`.
+- **`refresh token has been revoked`**: refresh tokens rotate on every refresh; if two clients share one config, the loser must re-authorize (`--init`).
+
+## Manual Wizard (Optional)
+
+```bash
+python feishu_dav.py            # enters the wizard when no config exists
+python feishu_dav.py --wizard   # reconfigure
+```
+
+Config is saved to `~/.feishu-dav/config.json` (mode 600 — it contains tokens, keep it private).
+
+## Tests
+
+```bash
+python tests/smoke_test.py
+```
+
+Runs the full WebDAV layer (path resolution, PROPFIND listing, GET download, docx export, PUT upload, read-only/delete gating) against an in-memory fake API client — no network needed.
+
+## License
+
+MIT
