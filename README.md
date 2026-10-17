@@ -1,6 +1,6 @@
 # feishu-dav
 
-[English](README.md) | [中文](README.zh.md)
+[English](README.md) | [中文](README.zh.md) | [Project page](https://muxueqz.top/feishu-dav.html)
 
 Mount Feishu (Lark) Drive as a local filesystem via WebDAV — a single-file Python server with OAuth Device Flow, auto app provisioning, and rclone-compatible mounting. No redirect URLs, no lark-cli.
 
@@ -10,7 +10,7 @@ Mount Feishu (Lark) Drive as a local filesystem via WebDAV — a single-file Pyt
 - **OAuth Device Flow (RFC 8628)** — authorize from any device (browser or Feishu mobile scan), no redirect URL configuration
 - **Auto app provisioning** — creates a PersonalAgent app for you via device flow, larkfs-style
 - **`--init` guided setup / `--doctor` self-check** — credential detection (CLI args → env vars → lark-cli config → interactive), automatic access verification
-- **rclone-compatible** — `rclone mount` with `--vfs-cache-mode writes`; also works with any WebDAV client
+- **rclone-compatible** — `rclone mount` with `--exclude "~.*" --dir-cache-time 3s --vfs-cache-mode off`; also works with any WebDAV client
 - **Online docs as read-only files** — docx/sheets/bitables/slides exported on the fly and cached
 - **Safe by default** — `--read-only` and delete gating; `~/.feishu-dav/config.json` stored with mode 600
 - **DPoP token refresh** — v3 token endpoint + DPoP proofs, aligned with lark-cli behavior
@@ -29,7 +29,7 @@ python feishu_dav.py --init
 ```
 
 The guided setup (larkfs-style):
-1. Resolves app credentials, in order: existing config → `--app-id/--app-secret` → env vars `FEISHU_APP_ID/FEISHU_APP_SECRET` → auto-detected `~/.lark-cli/config.json` (asks to reuse) → auto-creates a PersonalAgent app via device flow → falls back to interactive input
+1. Resolves app credentials, in order: existing config → `--app-id/--app-secret` → env vars `FEISHU_APP_ID/FEISHU_APP_SECRET` → auto-creates a PersonalAgent app via device flow → falls back to interactive input
 2. Runs OAuth Device Flow — prints a verification URL + user code, opens the browser when possible
 3. Verifies Drive access automatically and saves the config
 
@@ -48,8 +48,14 @@ python feishu_dav.py --init \
 ```bash
 rclone config create feishu webdav url=http://127.0.0.1:8765 vendor=other
 mkdir -p ~/feishu
-rclone mount feishu: ~/feishu --vfs-cache-mode writes --daemon
+rclone mount feishu: ~/feishu --exclude "~.*" --dir-cache-time 3s --vfs-cache-mode off --daemon
 ```
+
+Flag notes:
+
+* `--exclude "~.*"` — skip `~`-prefixed temp files. WPS/LibreOffice and friends create lock files like `~$xxx.docx` next to the document being edited; without this filter they get synced up to your Feishu Drive
+* `--dir-cache-time 3s` — expire directory listings after 3s. Online docs use lazy export (uncached docs advertise a 10 KiB placeholder size; the first open triggers the export), so a short dir cache makes the real size take effect quickly
+* `--vfs-cache-mode off` — stream reads, matching the lazy-export behavior
 
 ## CLI Reference
 
@@ -72,10 +78,11 @@ A wsgidav `DAVProvider` maps WebDAV operations onto the Feishu Open API with a u
 - **PROPFIND** → `GET /drive/v1/files` (paginated, 60 s TTL cache; the root shows your own space plus configured mounts)
 - **GET** → `GET /drive/v1/files/{token}/download` (streamed; the `/medias/...` endpoint is avoided — see troubleshooting)
 - **PUT** → `upload_all` (≤20 MB) or the server-planned prepare/part/finish chunked protocol (`seq` + per-chunk `size`)
-- **docx/sheet/bitable/slides** → exported on demand via export tasks and cached under `~/.feishu-dav/export_cache/`
+- **docx/sheet/bitable/slides** → exported on demand via export tasks, listed as `name.docx/xlsx/pdf`, and cached under `~/.feishu-dav/export_cache/` (the export API has no markdown format)
+- **"Export result is empty"** → usually the app version isn't published yet; create & publish a version in the developer console, then retry
 - **Token refresh** → accounts endpoint v3 with DPoP proofs (RFC 9449-style, ES256/P-256), refresh tokens rotated automatically
 
-File sizes shown as 0 are a Feishu list-API limitation; real sizes are lazily resolved via a `Range: bytes=0-0` probe and downloads are streamed by content.
+File sizes shown as 0 are a Feishu list-API limitation. Online docs use lazy export with a 10 KiB sentinel: listings never export (real size once cached, 10 KiB placeholder before that), and content is exported on first open/download, cached for 24h (`export_ttl` in config.json). The first open of an uncached doc therefore reads a truncated 10 KiB body (expected — it also triggers the export); reopen after the dir cache expires (`--dir-cache-time 3s`) and the full file is served.
 
 ## Troubleshooting
 

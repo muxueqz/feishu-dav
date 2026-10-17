@@ -16,6 +16,7 @@ import io
 import json
 import mimetypes
 import os
+import queue
 import re
 import sys
 import tempfile
@@ -245,25 +246,6 @@ def check_drive_access(cfg):
         return False, f"访问失败: {e}"
 
 
-def _detect_lark_cli_credential():
-    """从本机 lark-cli 配置 (~/.lark-cli/config.json) 探测可复用的 app_id/app_secret。"""
-    candidates = [
-        os.path.expanduser("~/.lark-cli/config.json"),
-        os.path.join(os.environ.get("ATOMCODE_HOME", ""), "lark-cli", "config.json"),
-    ]
-    for p in candidates:
-        if not p or not os.path.exists(p):
-            continue
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for app in data.get("apps") or []:
-                if app.get("appId") and app.get("appSecret"):
-                    return {"app_id": app["appId"], "app_secret": app["appSecret"], "source": p}
-        except (OSError, ValueError):
-            continue
-    return None
-
 
 def _register_app(brand_host="accounts.feishu.cn", open_host="https://open.feishu.cn",
                   no_browser=False):
@@ -325,7 +307,7 @@ def _register_app(brand_host="accounts.feishu.cn", open_host="https://open.feish
 
 def run_init(cfg_path=CONFIG_PATH, prefill=None):
     """larkfs init 风格的自动引导：
-    1. 检查已有配置 / 探测凭证来源（lark-cli 配置、环境变量、命令行参数、交互输入）
+    1. 检查已有配置 / 探测凭证来源（环境变量、命令行参数、交互输入）
     2. 未授权则自动完成 OAuth（打开浏览器）
     3. 自动验证访问并保存配置
     """
@@ -344,13 +326,6 @@ def run_init(cfg_path=CONFIG_PATH, prefill=None):
             cred = {"app_id": prefill["app_id"], "app_secret": prefill["app_secret"], "source": "命令行参数"}
         elif env_id and env_secret:
             cred = {"app_id": env_id, "app_secret": env_secret, "source": "环境变量 FEISHU_APP_ID/FEISHU_APP_SECRET"}
-        else:
-            cred = _detect_lark_cli_credential()
-            if cred:
-                print(f"· 检测到本机 lark-cli 应用凭证: {cred['source']}")
-                use = input(f"复用该应用 (app_id={cred['app_id']})? [Y/n]: ").strip().lower()
-                if use == "n":
-                    cred = None
         if cred is None:
             # 无任何现成凭证：优先尝试 Device Flow 自动创建应用（对标 lark-cli create-app）
             try:
@@ -556,6 +531,34 @@ class FeishuClient:
         self._dir_cache = {}          # folder_token -> (expire_ts, entries)
         self._dir_lock = threading.Lock()
         self.dir_ttl = 60
+        self._size_lock = threading.Lock()
+        self._size_queue = queue.Queue()
+        self._size_queued = set()     # 已入队去重
+        self._size_worker = None
+        self.export_ttl = int(cfg.get("export_ttl", 86400))  # 导出缓存有效期（秒）
+
+    def request_size_probe(self, file_token):
+        """把 file_token 交给后台线程探测大小（不阻塞调用方）。"""
+        with self._size_lock:
+            if file_token in self._size_queued or file_token in FeishuClient._size_cache:
+                return
+            self._size_queued.add(file_token)
+            self._size_queue.put(file_token)
+            if self._size_worker is None or not self._size_worker.is_alive():
+                self._size_worker = threading.Thread(
+                    target=self._size_probe_loop, daemon=True, name="feishu-dav-size-probe")
+                self._size_worker.start()
+
+    def _size_probe_loop(self):
+        while True:
+            token = self._size_queue.get()
+            try:
+                self.file_size(token)
+            except Exception:
+                pass  # 探测失败静默：下次列目录仍会返回 0，可再次入队
+            finally:
+                with self._size_lock:
+                    self._size_queued.discard(token)
 
     # ---- http 基础 ----
 
@@ -666,8 +669,9 @@ class FeishuClient:
 
     def file_size(self, file_token):
         """懒加载文件真实大小：list API 不返回 size，用 Range 0-0 从 Content-Range 取。"""
-        if file_token in FeishuClient._size_cache:
-            return FeishuClient._size_cache[file_token]
+        with self._size_lock:
+            if file_token in FeishuClient._size_cache:
+                return FeishuClient._size_cache[file_token]
         url = f"{OPEN_BASE}/open-apis/drive/v1/files/{file_token}/download"
         r = self._request("GET", url, headers={"Range": "bytes=0-0"}, stream=True)
         r.close()
@@ -678,7 +682,8 @@ class FeishuClient:
                 total = int(cr.rsplit("/", 1)[1])
             except ValueError:
                 total = None
-        FeishuClient._size_cache[file_token] = total
+        with self._size_lock:
+            FeishuClient._size_cache[file_token] = total
         return total
 
     def upload(self, folder_token, filename, data_or_path, size):
@@ -765,17 +770,26 @@ class FeishuClient:
     EXPORTABLE = {"docx": "docx", "doc": "docx", "sheet": "xlsx", "bitable": "xlsx",
                   "slides": "pdf", "mindnote": "pdf"}
 
+    def export_cache_path(self, entry):
+        """返回 entry 的导出缓存文件路径；类型不可导出时返回 None。"""
+        ext = self.EXPORTABLE.get(entry["type"])
+        if not ext:
+            return None
+        return os.path.join(CONFIG_DIR, "export_cache", f"{entry['token']}.{ext}")
+
     def export_content(self, entry):
         """导出在线文档为字节流；带磁盘缓存。"""
         ext = self.EXPORTABLE.get(entry["type"])
         if not ext:
             raise FeishuError(f"类型 {entry['type']} 不支持导出", status=403, code=403)
-        cache_dir = os.path.join(CONFIG_DIR, "export_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, f"{entry['token']}.{ext}")
-        if os.path.exists(cache_path) and time.time() - os.path.getmtime(cache_path) < self.dir_ttl:
-            with open(cache_path, "rb") as f:
-                return ext, f.read()
+        cache_path = self.export_cache_path(entry)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        if os.path.exists(cache_path):
+            if os.path.getsize(cache_path) == 0:
+                os.unlink(cache_path)  # 历史坏缓存：空文件不命中
+            elif time.time() - os.path.getmtime(cache_path) < self.export_ttl:
+                with open(cache_path, "rb") as f:
+                    return ext, f.read()
         r = self._request("POST", "/open-apis/drive/v1/export_tasks",
                           json={"file_extension": ext, "token": entry["token"],
                                 "type": entry["type"]})
@@ -787,11 +801,17 @@ class FeishuClient:
             result = r.json()["data"]["result"]
             if result.get("job_status", 0) == 0:  # 0 = success
                 dl = self._request("GET",
-                                   f"/open-apis/drive/v1/export_tasks/file/{entry['token']}/download")
+                                   f"/open-apis/drive/v1/export_tasks/file/{result['file_token']}/download",
+                                   params={"token": ticket})
                 with open(cache_path, "wb") as f:
                     for chunk in dl.iter_content(1 << 20):
                         f.write(chunk)
-                return ext, open(cache_path, "rb").read()
+                if os.path.getsize(cache_path) == 0:
+                    os.unlink(cache_path)
+                    raise FeishuError("导出结果为空（请检查应用权限是否已发布）",
+                                      status=502, code=502)
+                with open(cache_path, "rb") as f:
+                    return ext, f.read()
         raise FeishuError("文档导出超时", status=504, code=504)
 
 
@@ -900,15 +920,21 @@ class FeishuFile(DAVNonCollection):
         if self.entry is None:
             return 0
         if self.entry["type"] in FeishuClient.EXPORTABLE:
-            try:
-                _, blob = self.client.export_content(self.entry)
-                return len(blob)
-            except FeishuError:
-                return 0
+            # lazy 导出 + 10K 哨兵：列目录不导出——有缓存报真实大小，无缓存
+            # 报 10K 占位（非 0 大小才能让 rclone 打开时真正发 GET 触发导出；
+            # 首次读到的内容会被截断，属预期，缓存生效后重新列目录即恢复）。
+            # 实际内容在 GET 时导出并分块流式返回（不声明 Content-Length）
+            cache_path = self.client.export_cache_path(self.entry)
+            if cache_path and os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+                return os.path.getsize(cache_path)
+            return 10 << 10  # 10K 哨兵
         size = self.entry.get("size") or 0
         if not size and self.entry["type"] == "file":
-            # list API 不返回 size，懒加载真实大小（Range 0-0）
-            size = self.client.file_size(self.entry["token"]) or 0
+            # list API 不返回 size：命中缓存直接用，未命中交后台探测，列目录不阻塞
+            size = self.client.file_size(self.entry["token"])
+            if size is None:
+                self.client.request_size_probe(self.entry["token"])
+                size = 0
             self.entry["size"] = size
         return size
 
@@ -924,7 +950,9 @@ class FeishuFile(DAVNonCollection):
         return (self.entry or {}).get("token") or "pending"
 
     def get_display_name(self):
-        return self.pending_name or (self.entry or {}).get("name", "")
+        if self.pending_name:
+            return self.pending_name
+        return self.provider._display_name(self.entry) if self.entry else ""
 
     def get_last_modified(self):
         return (self.entry or {}).get("mtime") or None
@@ -933,6 +961,9 @@ class FeishuFile(DAVNonCollection):
         return False
 
     def support_content_length(self):
+        # 未缓存的在线文档报 10K 哨兵大小：GET 直接声明 Content-Length: 10240，
+        # wsgidav 流式读满 10240 后截断——客户端首开拿到不完整内容（预期内），
+        # 导出缓存已生成，重新列目录后即报真实大小、完整读取
         # 飞书 list API 不返回 size；size 未知时不声明 Content-Length，
         # 避免 wsgidav 按 0 长度发空响应（改为流式读到 EOF）
         return bool(self.get_content_length())
@@ -1033,7 +1064,7 @@ class FeishuProvider(DAVProvider):
         seen = {}
         out = {}
         for e in entries:
-            name = e["name"]
+            name = self._display_name(e)
             if name in seen or name in out:
                 disp = f"{name}{SUFFIX_SEP}{e['token'][:8]}"
                 out[disp] = e
@@ -1041,6 +1072,15 @@ class FeishuProvider(DAVProvider):
                 seen[name] = e
                 out[name] = e
         return out
+
+    @staticmethod
+    def _display_name(e):
+        """在线文档等导出型条目追加导出扩展名（如 xxx.docx），便于本地按扩展名打开。"""
+        name = e["name"]
+        ext = FeishuClient.EXPORTABLE.get(e["type"])
+        if ext and not name.lower().endswith("." + ext):
+            name = f"{name}.{ext}"
+        return name
 
     def _mount_for(self, first):
         mounts = self.cfg.get("mounts") or []
@@ -1071,6 +1111,10 @@ class FeishuProvider(DAVProvider):
         members = self.members(folder_token)
         if name in members:
             return members[name]
+        # 兼容不带导出扩展名的裸文档名（如 xxx 或 xxx~token8）
+        for e in members.values():
+            if name in (e["name"], self._display_name(e)):
+                return e
         # 处理去重后缀 name~token8
         if SUFFIX_SEP in name:
             base, suffix = name.rsplit(SUFFIX_SEP, 1)

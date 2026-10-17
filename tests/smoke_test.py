@@ -8,6 +8,7 @@ list/download/upload/export 全链路验证（不含真实飞书服务端）。
 import io
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from feishu_dav import FeishuClient, FeishuProvider  # noqa: E402
@@ -31,6 +32,8 @@ class FakeClient(FeishuClient):
                  "mtime": 1700000000, "url": ""},
                 {"token": "file1", "name": "hello.txt", "type": "file", "size": 6,
                  "mtime": 1700000001, "url": ""},
+                {"token": "file3", "name": "zero.txt", "type": "file", "size": 0,
+                 "mtime": 1700000005, "url": ""},
                 {"token": "docx1", "name": "在线文档", "type": "docx", "size": 0,
                  "mtime": 1700000002, "url": ""},
             ],
@@ -41,10 +44,28 @@ class FakeClient(FeishuClient):
                  "mtime": 1700000002, "url": ""},
             ],
         }
-        self.blobs = {"file1": b"hello!", "file2": b"abc"}
+        self.blobs = {"file1": b"hello!", "file2": b"abc", "file3": b"zz"}
         self.exports = {"docx1": b"EXPORTED-DOCX"}
         self.uploaded = []
         self.dir_ttl = 0
+        self.export_calls = 0
+        self.probe_requested = []
+        # 预置导出缓存（列目录应读到缓存大小而不触发 export_content）
+        self.cache_dir = tempfile.mkdtemp(prefix="feishu-dav-test-cache-")
+        with open(os.path.join(self.cache_dir, "docx1.docx"), "wb") as f:
+            f.write(self.exports["docx1"])
+
+    def export_cache_path(self, entry):
+        ext = self.EXPORTABLE.get(entry["type"])
+        if not ext:
+            return None
+        return os.path.join(self.cache_dir, f"{entry['token']}.{ext}")
+
+    def request_size_probe(self, file_token):
+        self.probe_requested.append(file_token)
+
+    def file_size(self, file_token):
+        return None  # 模拟未缓存：列目录不应阻塞在此
 
     def list_dir(self, folder_token=None, use_cache=True):
         return list(self.entries.get(folder_token, []))
@@ -71,6 +92,14 @@ class FakeClient(FeishuClient):
         return True
 
     def export_content(self, entry):
+        # 与真实实现一致：缓存命中不计数，未缓存导出并写缓存
+        path = self.export_cache_path(entry)
+        if path and os.path.exists(path):
+            with open(path, "rb") as f:
+                return "docx", f.read()
+        self.export_calls += 1
+        with open(path, "wb") as f:
+            f.write(self.exports[entry["token"]])
         return "docx", self.exports[entry["token"]]
 
 
@@ -96,16 +125,31 @@ def main():
     root = provider.get_resource_inst("/", ENV)
     names = root.get_member_names()
     # 根目录 = 我的云空间内容 + 挂载点（同名挂载点优先）
-    assert "Shared" in names and "hello.txt" in names and "在线文档" in names and "docs" in names, names
+    assert "Shared" in names and "hello.txt" in names and "在线文档.docx" in names and "docs" in names, names
     sub = provider.get_resource_inst("/Shared", ENV)
     sub_names = sub.get_member_names()
-    assert "inner.txt" in sub_names and "在线文档" in sub_names, sub_names
+    assert "inner.txt" in sub_names and "在线文档.docx" in sub_names, sub_names
     sub_members = {r.get_display_name(): r for r in sub.get_member_list()}
     assert sub_members["inner.txt"].get_content_length() == 3
     assert sub_members["inner.txt"].get_content_type() == "text/plain"
-    assert sub_members["在线文档"].get_content_length() == len(b"EXPORTED-DOCX")
-    assert "officedocument" in sub_members["在线文档"].get_content_type()
+    assert sub_members["在线文档.docx"].get_content_length() == len(b"EXPORTED-DOCX")
+    assert "officedocument" in sub_members["在线文档.docx"].get_content_type()
     print(f"✓ 根目录(云空间+挂载点): {names}，挂载点内: {sub_names}")
+
+    # --- 2c. 零大小文件走后台探测；列目录零导出、GET 时才导出 ---
+    zero = provider.get_resource_inst("/zero.txt", ENV)
+    assert zero is not None and zero.get_content_length() == 0
+    assert fake.probe_requested == ["file3"], fake.probe_requested
+    # 有缓存报真实大小；删缓存后列目录报 10K 哨兵且不触发导出
+    assert sub_members["在线文档.docx"].get_content_length() == len(b"EXPORTED-DOCX")
+    os.unlink(os.path.join(fake.cache_dir, "docx1.docx"))
+    assert sub_members["在线文档.docx"].get_content_length() == 10 << 10
+    assert sub_members["在线文档.docx"].support_content_length() is True
+    assert fake.export_calls == 0, "列目录不应触发 export_content"
+    # GET 才导出
+    got = provider.get_resource_inst("/Shared/在线文档.docx", ENV).get_content().read()
+    assert got == b"EXPORTED-DOCX" and fake.export_calls == 1, (got, fake.export_calls)
+    print(f"✓ 列目录零导出，GET 时才导出: export_calls={fake.export_calls}")
 
     # --- 2b. 无挂载点时根目录 = 我的云空间 ---
     no_mount_provider = FeishuProvider(fake, {"mounts": [], "read_only": False, "allow_delete": True})

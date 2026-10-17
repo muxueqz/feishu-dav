@@ -1,6 +1,6 @@
 # feishu-dav
 
-[English](README.md) | [中文](README.zh.md)
+[English](README.md) | [中文](README.zh.md) | [项目主页](https://muxueqz.top/feishu-dav.html)
 
 把飞书云盘（Drive）通过 WebDAV 暴露为 HTTP 服务，配合 `rclone mount` 挂载到 Linux。
 纯 OAuth `user_access_token` 直连飞书开放平台，不依赖 lark-cli。单文件实现（`feishu_dav.py`）。
@@ -18,7 +18,7 @@ python feishu_dav.py --init
 ```
 
 自动引导流程（larkfs init 风格）：
-1. 检查应用凭证：已有配置直接使用；否则按顺序尝试 命令行参数 `--app-id/--app-secret` → 环境变量 `FEISHU_APP_ID/FEISHU_APP_SECRET` → 自动探测本机 `~/.lark-cli/config.json` 里的应用并询问是否复用 → 最后交互输入（并给出开发者后台创建应用的指引）
+1. 检查应用凭证：已有配置直接使用；否则按顺序尝试 命令行参数 `--app-id/--app-secret` → 环境变量 `FEISHU_APP_ID/FEISHU_APP_SECRET` → 自动创建应用 / 最后交互输入（并给出开发者后台创建应用的指引）
 2. 未授权则自动打开浏览器完成 OAuth（本地回调 127.0.0.1:8577）
 3. 自动验证云盘访问权限并保存配置
 
@@ -42,7 +42,7 @@ SSH/headless 场景：加 `--no-browser` 只打印授权链接（可复制到本
 
 ## 故障排查
 
-- **文件大小显示为 0**：飞书 `drive/v1/files` 列表接口不返回 size 字段，PROPFIND 只能报 0；不影响实际读取/下载（rclone 流式传输按实际内容计）。上传后的文件大小正常
+- **文件大小显示为 0 / 在线文档首次打开不完整**：飞书 `drive/v1/files` 列表接口不返回 size 字段，在线文档采用 lazy 导出 + 10K 哨兵：列目录零导出（有缓存报真实大小，无缓存报 10K 占位），**首次打开时才真正导出**并写缓存（`export_ttl` 24h，可在 `config.json` 调整）。因此未缓存文档第一次打开会读到 10K 截断内容（预期内，但已触发导出），等目录缓存过期（挂载建议 `--dir-cache-time 3s`）后重新打开即完整；`rclone cat/cp` 同理。建议挂载参数见「用 rclone 挂载」一节
 - **授权超时**：链接有效期约 4 分钟，超时后重跑 `--init` 即可
 - **部分文件下载 403（空响应体）**：自动创建的 PersonalAgent 应用即使授权页显示包含 `drive:file:download`，媒体下载接口仍可能返回 403（lark-cli 等后台开通了权限的应用可正常下载）。解决：到[开发者后台](https://open.feishu.cn/app)对应应用 →「权限管理」确认 drive 相关权限已开通 →「版本管理与发布」**创建版本并发布**（仅开通不发布不生效），然后重新 `--init` 授权
 
@@ -72,14 +72,21 @@ python feishu_dav.py [--host 127.0.0.1] [--port 8765] [--read-only] [--allow-del
 ```bash
 rclone config create feishu webdav url=http://127.0.0.1:8765 vendor=other
 mkdir -p ~/feishu
-rclone mount feishu: ~/feishu --vfs-cache-mode writes --daemon
+rclone mount feishu: ~/feishu --exclude "~.*" --dir-cache-time 3s --vfs-cache-mode off --daemon
 ```
+
+参数说明：
+
+* `--exclude "~.*"`：排除 `~` 开头的临时文件。WPS/LibreOffice 等办公软件编辑本地文档时会在目录里创建 `~$xxx.docx` 这类锁文件/临时文件，不排除的话它们会被同步上传到飞书云盘
+* `--dir-cache-time 3s`：目录缓存 3 秒过期。在线文档采用 lazy 导出（未缓存文档报 10K 占位大小，首开触发导出），短目录缓存能让真实大小尽快生效
+* `--vfs-cache-mode off`：流式读取，配合 lazy 导出
 
 不带 rclone 也可直接用 WebDAV 客户端或 `rclone lsf feishu:` 浏览。
 
 ## 说明
 
-- 在线文档（docx/sheet/bitable/slides）映射为只读虚拟文件，内容为导出产物（docx/xlsx/pdf），结果缓存于 `~/.feishu-dav/export_cache/`
+- 在线文档（docx/sheet/bitable/slides）映射为只读虚拟文件，目录中显示为 `文档名.docx/xlsx/pdf`（内容为导出产物），结果缓存于 `~/.feishu-dav/export_cache/`；导出 API 不支持 markdown，故无 md 格式
+- 「导出结果为空」报错：通常是应用权限未「创建版本并发布」，到开发者后台发布后重试
 - 同名文件会显示为 `name~token前8位` 以保证路径唯一
 - 目录列表有 60s TTL 缓存；写操作后主动失效
 - 「共享给我」的文件夹：在向导里把其 folder_token 加为挂载点即可（需要应用 scope 覆盖，且你有相应访问权限）
